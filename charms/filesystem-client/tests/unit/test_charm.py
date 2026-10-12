@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from charm import FilesystemClientCharm
+from charms.filesystem_client.v0.filesystem_info import NfsInfo
 from charms.filesystem_client.v0.mount_info import MountInfo
 from ops import testing
 from utils.manager import Error
@@ -120,3 +121,161 @@ def test_lnet_networks_config_parsed(ctx: testing.Context, mock_mounts_manager: 
         "tcp": ["eth0"],
         "o2ib": ["ib0", "ib1"],
     }
+
+
+def test_lxd_container_blocked(ctx: testing.Context, mock_mounts_manager: MagicMock) -> None:
+    """The charm blocks on LXD containers instead of attempting mounts that cannot work."""
+    mock_mounts_manager.supported.return_value = False
+
+    state_out = ctx.run(ctx.on.config_changed(), testing.State())
+
+    assert state_out.unit_status == testing.BlockedStatus(
+        "Cannot mount filesystems on LXD containers"
+    )
+    mock_mounts_manager.setup.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "leader", (pytest.param(True, id="leader"), pytest.param(False, id="not leader"))
+)
+def test_no_filesystem_integration_blocked(
+    ctx: testing.Context, mock_mounts_manager: MagicMock, leader: bool
+) -> None:
+    """Without a filesystem integration the unit blocks and the leader reflects it on the app."""
+    state_in = testing.State(leader=leader, config={"mountpoint": "/nfs"})
+    mock_mounts_manager.supported.return_value = True
+    mock_mounts_manager.is_setup.return_value = True
+
+    state_out = ctx.run(ctx.on.config_changed(), state_in)
+
+    expected = testing.BlockedStatus("Waiting for an integration with a filesystem provider")
+    assert state_out.unit_status == expected
+    assert state_out.app_status == (expected if leader else testing.UnknownStatus())
+
+
+@pytest.mark.parametrize(
+    "leader", (pytest.param(True, id="leader"), pytest.param(False, id="not leader"))
+)
+def test_integrated_with_provider_app_status(
+    ctx: testing.Context, mock_mounts_manager: MagicMock, leader: bool
+) -> None:
+    """The leader reports the integrated filesystem type on the application status."""
+    fs_rel = testing.Relation(
+        endpoint="filesystem",
+        remote_app_data={"endpoint": "nfs://(192.168.1.1)/srv"},
+    )
+    state_in = testing.State(
+        leader=leader,
+        relations={fs_rel},
+        config={"mountpoint": "/nfs"},
+    )
+    mock_mounts_manager.supported.return_value = True
+    mock_mounts_manager.is_setup.return_value = True
+
+    state_out = ctx.run(ctx.on.config_changed(), state_in)
+
+    assert state_out.unit_status == testing.ActiveStatus("Mounted filesystem at `/nfs`")
+    expected = (
+        testing.ActiveStatus("Integrated with `nfs` provider")
+        if leader
+        else testing.UnknownStatus()
+    )
+    assert state_out.app_status == expected
+
+
+def test_multiple_mount_relations_blocked(
+    ctx: testing.Context, mock_mounts_manager: MagicMock
+) -> None:
+    """More than one `mount` relation is rejected: a unit can only mount one filesystem."""
+    state_in = testing.State(
+        relations={
+            testing.SubordinateRelation(endpoint="mount"),
+            testing.SubordinateRelation(endpoint="mount"),
+        }
+    )
+    mock_mounts_manager.supported.return_value = True
+    mock_mounts_manager.is_setup.return_value = True
+
+    state_out = ctx.run(ctx.on.config_changed(), state_in)
+
+    assert state_out.unit_status == testing.BlockedStatus(
+        "Cannot mount using more than one relation at the same time"
+    )
+
+
+def test_mount_relation_without_mountpoint_waiting(
+    ctx: testing.Context, mock_mounts_manager: MagicMock
+) -> None:
+    """The charm waits when the mount requirer has not yet provided a mountpoint."""
+    mount_rel = testing.SubordinateRelation(endpoint="mount", remote_app_data={})
+    state_in = testing.State(relations={mount_rel})
+    mock_mounts_manager.supported.return_value = True
+    mock_mounts_manager.is_setup.return_value = True
+
+    state_out = ctx.run(ctx.on.config_changed(), state_in)
+
+    assert state_out.unit_status == testing.WaitingStatus(
+        "Waiting for mountpoint from `mount` integration"
+    )
+
+
+def test_mountpoint_config_and_mount_relation_blocked(
+    ctx: testing.Context, mock_mounts_manager: MagicMock
+) -> None:
+    """Setting `mountpoint` config while integrated with a mount requirer is rejected."""
+    mount_rel = testing.SubordinateRelation(
+        endpoint="mount",
+        remote_app_data={
+            k: json.dumps(v) for k, v in asdict(MountInfo(mountpoint="/mnt/nfs")).items()
+        },
+    )
+    state_in = testing.State(relations={mount_rel}, config={"mountpoint": "/nfs"})
+    mock_mounts_manager.supported.return_value = True
+    mock_mounts_manager.is_setup.return_value = True
+
+    state_out = ctx.run(ctx.on.config_changed(), state_in)
+
+    assert state_out.unit_status == testing.BlockedStatus(
+        "Cannot mount using both the `mountpoint` config and the `mount` integration"
+    )
+
+
+@pytest.mark.parametrize(
+    "config,expected_options",
+    (
+        pytest.param({}, ["exec", "suid", "dev", "rw"], id="defaults"),
+        pytest.param(
+            {"noexec": True, "nosuid": True, "nodev": True, "read-only": True},
+            ["noexec", "nosuid", "nodev", "ro"],
+            id="hardened",
+        ),
+    ),
+)
+def test_config_mapped_to_mount_options(
+    ctx: testing.Context,
+    mock_mounts_manager: MagicMock,
+    config: dict,
+    expected_options: list[str],
+) -> None:
+    """The mount security config options are mapped to the options handed to the manager.
+
+    Failure mode: a flipped mapping would silently mount the filesystem with the
+    execution, suid, or device access that the operator explicitly disabled.
+    """
+    fs_rel = testing.Relation(
+        endpoint="filesystem",
+        remote_app_data={"endpoint": "nfs://(192.168.1.1)/srv"},
+    )
+    state_in = testing.State(relations={fs_rel}, config={"mountpoint": "/nfs", **config})
+    mock_mounts_manager.supported.return_value = True
+    mock_mounts_manager.is_setup.return_value = True
+
+    state_out = ctx.run(ctx.on.config_changed(), state_in)
+
+    mounts = mock_mounts_manager.mounts.return_value.__enter__.return_value
+    mounts.add.assert_called_once_with(
+        info=NfsInfo(hostname="192.168.1.1", port=None, path="/srv", version=None),
+        mountpoint="/nfs",
+        options=expected_options,
+    )
+    assert state_out.unit_status == testing.ActiveStatus("Mounted filesystem at `/nfs`")
