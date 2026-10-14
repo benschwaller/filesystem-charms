@@ -153,6 +153,21 @@ class TestMgsNidsPublished:
 
         mgs_publish.set_app_data.assert_not_called()
 
+    def test_leader_republish_reordered_nids_idempotent(
+        self, mgs_publish: MgsPublishMocks
+    ) -> None:
+        """Leader re-publishing the same NIDs in a different order is not an error.
+
+        LNet may report NIDs in a different order across reboots; order alone
+        must not be misread as a NID change.
+        """
+        mgs_publish.app_data.mgs_nids = list(reversed(MGS_NIDS))
+        mgs_publish.app_data.mgs_unit_name = MGS_UNIT_NAME
+
+        mgs_publish.observer.mgs_nids_published()
+
+        mgs_publish.set_app_data.assert_not_called()
+
     def test_leader_nids_changed_error(self, mgs_publish: MgsPublishMocks) -> None:
         """Leader raises an error when its NIDs change after promotion."""
         mgs_publish.app_data.mgs_nids = ["10.0.0.99@tcp"]
@@ -192,7 +207,8 @@ class TestOnRelationChanged:
         unit_data = lustre_peer.LustrePeerUnitData()
         mocker.patch("lustre_peer.LustrePeerObserver.get_app_data", return_value=app_data)
         mocker.patch("lustre_peer.LustrePeerObserver.get_unit_data", return_value=unit_data)
-        mock_model.storages = {"ost": [MagicMock(location=d) for d in OST_DEVICES]}
+        # Attach devices unordered to verify sorting before they are forwarded.
+        mock_model.storages = {"ost": [MagicMock(location=d) for d in reversed(OST_DEVICES)]}
 
         mock_oss = mocker.patch("lustre_peer.lustre_fs.oss_setup")
         return mock_model, mock_oss
@@ -215,7 +231,7 @@ class TestOnRelationChanged:
         observer = lustre_peer.LustrePeerObserver(mocker.MagicMock())
         observer._on_relation_changed(app_data_event)
 
-        mock_oss.assert_called_once_with(LUSTRE_FSNAME, OSS_UNIT_NAME, MGS_NIDS, mocker.ANY)
+        mock_oss.assert_called_once_with(LUSTRE_FSNAME, OSS_UNIT_NAME, MGS_NIDS, OST_DEVICES)
         assert mock_model.unit.status == expected_status
 
     def test_app_data_error(
@@ -492,8 +508,58 @@ class TestSetAppData:
         rel.save.assert_called_once_with(data, rel.app)
 
 
+class TestSetUnitReady:
+    """set_unit_ready() tests."""
+
+    def test_marks_unit_ready_and_publishes(
+        self, mocker: MockerFixture, mock_model: MagicMock
+    ) -> None:
+        """Readiness is written to the unit databag and a publish attempt follows.
+
+        The leader only publishes filesystem info once every unit's databag
+        reports `ready=True`; a unit that never writes it blocks the cluster
+        from ever becoming usable by clients.
+        """
+        mocker.patch(
+            "lustre_peer.LustrePeerObserver.get_unit_data",
+            return_value=lustre_peer.LustrePeerUnitData(),
+        )
+        set_unit_data = mocker.patch("lustre_peer.LustrePeerObserver.set_unit_data")
+        publish_fs_info = mocker.patch(
+            "lustre_peer.LustrePeerObserver._try_publish_filesystem_info"
+        )
+
+        observer = lustre_peer.LustrePeerObserver(mocker.MagicMock())
+        observer.set_unit_ready(MGS_NIDS, LUSTRE_FSNAME)
+
+        unit_data = set_unit_data.call_args[0][0]
+        assert unit_data.ready is True
+        publish_fs_info.assert_called_once_with(MGS_NIDS, LUSTRE_FSNAME)
+
+
 class TestAllUnitsReady:
     """_all_units_ready() tests."""
+
+    def test_all_units_ready(
+        self, mocker: MockerFixture, mock_model_with_relation: tuple[MagicMock, MagicMock]
+    ) -> None:
+        """Returns True exactly when the ready count reaches the planned count.
+
+        The self unit is not in `rel.units` and must be counted; a single-unit
+        deployment never satisfies `ready > planned`.
+        """
+        model, rel = mock_model_with_relation
+        model.app.planned_units.return_value = 1
+        model.unit.name = MGS_UNIT_NAME
+        rel.units = []
+
+        mocker.patch(
+            "lustre_peer.LustrePeerObserver.get_unit_data",
+            return_value=lustre_peer.LustrePeerUnitData(ready=True),
+        )
+
+        observer = lustre_peer.LustrePeerObserver(mocker.MagicMock())
+        assert observer._all_units_ready() is True
 
     def test_not_all_units_ready(
         self, mocker: MockerFixture, mock_model_with_relation: tuple[MagicMock, MagicMock]

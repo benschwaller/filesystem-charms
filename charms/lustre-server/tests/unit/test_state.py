@@ -156,6 +156,23 @@ class TestOssStatus:
             state._oss_check(mount_directory=str(tmp_path))
         assert e.value.status == expected_status
 
+    def test_non_ost_entries_ignored(self, mocker: MockerFixture, tmp_path: Path) -> None:
+        """Lookalike directories (e.g. an old backup) are not treated as OSTs.
+
+        Checking a stale non-mount directory as if it were an OST would block a
+        healthy OSS unit.
+        """
+        ost = tmp_path / "ost0"
+        ost.mkdir()
+        stale = tmp_path / "ost_backup"
+        stale.mkdir()
+
+        mock_check = mocker.patch("state._mountpoint_check")
+
+        state._oss_check(mount_directory=str(tmp_path))
+
+        mock_check.assert_called_once_with(ost)
+
     def test_no_osts_exist(self, mocker: MockerFixture, tmp_path: Path) -> None:
         """No OST mountpoints exist."""
         expected_status = ops.BlockedStatus(

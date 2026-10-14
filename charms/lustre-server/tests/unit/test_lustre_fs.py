@@ -98,7 +98,7 @@ class TestOssSetup:
     """oss_setup() tests."""
 
     FSNAME = "testfs"
-    MGS_NID = "10.0.0.1@tcp"
+    MGS_NIDS = ["10.0.0.1@tcp", "10.0.0.2@o2ib0"]
     DEVICES = ["/dev/0", "/dev/1", "/dev/2"]
 
     def test_correct_pool_and_index(self, mocker: MockerFixture) -> None:
@@ -107,7 +107,7 @@ class TestOssSetup:
         mock_target = mocker.patch("lustre_fs._lustre_target", autospec=True)
         mocker.patch("lustre_fs._mount")
 
-        lustre_fs.oss_setup(self.FSNAME, "lustre/2", self.MGS_NID, self.DEVICES)
+        lustre_fs.oss_setup(self.FSNAME, "lustre/2", self.MGS_NIDS, self.DEVICES)
 
         _, pool, dataset, index = mock_target.call_args[0]
         assert (pool, dataset, index) == (
@@ -116,11 +116,33 @@ class TestOssSetup:
             2,
         )
 
-    def test_bad_unit_name_raises(self, mocker: MockerFixture) -> None:
+    def test_mgs_nids_joined_in_mkfs_flags(self, mocker: MockerFixture) -> None:
+        """Multiple MGS NIDs are comma-joined into a single --mgsnode flag.
+
+        mkfs.lustre expects `--mgsnode=nid1,nid2`; a joined-in-flag error leaves
+        OSTs unable to reach the MGS at mount time.
+        """
+        mocker.patch("lustre_fs._ost_zpool")
+        mock_target = mocker.patch("lustre_fs._lustre_target", autospec=True)
+        mocker.patch("lustre_fs._mount")
+
+        lustre_fs.oss_setup(self.FSNAME, "lustre/2", self.MGS_NIDS, self.DEVICES)
+
+        mkfs_flags = mock_target.call_args[1]["mkfs_flags"]
+        assert "--mgsnode=10.0.0.1@tcp,10.0.0.2@o2ib0" in mkfs_flags
+
+    @pytest.mark.parametrize(
+        "unit_name, expected_cause",
+        [("badname", IndexError), ("lustre/notanumber", ValueError)],
+        ids=["no-unit-separator", "non-numeric-unit-number"],
+    )
+    def test_bad_unit_name_raises(
+        self, mocker: MockerFixture, unit_name: str, expected_cause: type[Exception]
+    ) -> None:
         """Bad unit name raises an error."""
         with pytest.raises(LustreFilesystemError) as excinfo:
-            lustre_fs.oss_setup(self.FSNAME, "badname", self.MGS_NID, self.DEVICES)
-        assert isinstance(excinfo.value.__cause__, IndexError)
+            lustre_fs.oss_setup(self.FSNAME, unit_name, self.MGS_NIDS, self.DEVICES)
+        assert isinstance(excinfo.value.__cause__, expected_cause)
 
     def test_zpool_failure(self, mocker: MockerFixture) -> None:
         """Zpool creation failure."""
@@ -128,7 +150,7 @@ class TestOssSetup:
         mocker.patch("lustre_fs._ost_zpool", side_effect=LustreFilesystemError("failure"))
 
         with pytest.raises(LustreFilesystemError):
-            lustre_fs.oss_setup(self.FSNAME, "lustre/0", self.MGS_NID, devices)
+            lustre_fs.oss_setup(self.FSNAME, "lustre/0", self.MGS_NIDS, devices)
 
 
 class TestEnsureZfsImportService:
@@ -304,6 +326,19 @@ class TestLustreTarget:
         ]
         assert actual_cmd == expected_cmd
 
+    def test_non_zero_index_preserved_in_flags(
+        self, target_missing: None, mock_run: MagicMock
+    ) -> None:
+        """A non-zero target index is forwarded to mkfs.lustre as --index.
+
+        OSS targets derive their index from the unit number; a hard-coded
+        --index=0 would collide with the MGT/MDT target's index 0.
+        """
+        lustre_fs._lustre_target(self.FSNAME, self.POOL, self.DATASET, 3, mkfs_flags=["--ost"])
+
+        actual_cmd = mock_run.call_args[0][0]
+        assert "--index=3" in actual_cmd
+
     def test_skips_when_target_exists(self, target_exists: None, mock_run: MagicMock) -> None:
         """Skips formatting the Lustre target when it already exists."""
         lustre_fs._lustre_target(
@@ -338,6 +373,8 @@ class TestMount:
         mock_run.assert_called_once_with(
             [MOUNT_EXECUTABLE, "-t", "lustre", "pool/dataset", str(mountpoint_tmp)], check=True
         )
+        # The mountpoint directory must be created before mounting into it.
+        assert mountpoint_tmp.is_dir()
 
     def test_skips_when_already_mounted(
         self, mocker: MockerFixture, mountpoint_tmp: Path, mock_run: MagicMock

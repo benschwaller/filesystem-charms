@@ -72,6 +72,7 @@ class TestCharmInstall:
         """Successful install."""
         out = ctx.run(ctx.on.install(), testing.State())
         assert out.unit_status == testing.MaintenanceStatus(charm._CharmStatus.PREPARING_SERVICES)
+        mock_apt.add_package.assert_called_once_with(LUSTRE_PACKAGES)
 
     def test_lnet_networks_config_forwarded(
         self,
@@ -534,3 +535,80 @@ class TestCharmStart:
         assert out.unit_status == testing.BlockedStatus(
             charm._CharmStatus.INVALID_OSS_DEVICE_COUNT
         )
+
+    def test_update_status_refreshes_unit_status(
+        self,
+        ctx: testing.Context[charm.LustreCharm],
+        mock_refresh: MagicMock,
+    ) -> None:
+        """The update-status hook refreshes the unit status.
+
+        A unit stuck on a stale status (e.g. Blocked from an earlier failure)
+        only recovers if update-status re-evaluates the health check.
+        """
+        out = ctx.run(ctx.on.update_status(), testing.State(leader=True))
+
+        assert out.unit_status == mock_refresh.return_value
+
+    def test_storage_attached_triggers_start(
+        self,
+        ctx: testing.Context[charm.LustreCharm],
+        mocker: MockerFixture,
+        mock_oss_setup: MagicMock,
+        mock_peer_observer: MagicMock,
+    ) -> None:
+        """Attaching storage runs the start logic.
+
+        Rebootless storage attachment must set up services without waiting for
+        another `start` hook, which Juju never re-fires on a running unit.
+        """
+        ost_storages = [testing.Storage(name="ost") for _ in range(3)]
+        nids = ["10.0.0.1@tcp"]
+        app_data = LustrePeerAppData(mgs_nids=nids, mgs_unit_name=f"{APP_NAME}/1")
+        mock_peer_observer.return_value.get_app_data.return_value = app_data
+        state = testing.State(leader=True, storages=set(ost_storages))
+
+        ctx.run(ctx.on.storage_attached(ost_storages[0]), state)
+
+        mock_oss_setup.assert_called_once_with(LUSTRE_FSNAME, f"{APP_NAME}/0", nids, mocker.ANY)
+
+    def test_transient_storage_unavailability_retries(
+        self,
+        ctx: testing.Context[charm.LustreCharm],
+        mocker: MockerFixture,
+        mock_mgs_mds_setup: MagicMock,
+        mock_peer_observer: MagicMock,
+        mock_storage_devices: dict[str, list[MagicMock]],
+    ) -> None:
+        """Start retries storage access until devices become available.
+
+        Storage access is briefly broken after a unit re-executes `start` before
+        Juju has reprovisioned devices (e.g. after a reboot). The handler must
+        retry rather than fail the hook on the first `ModelError`.
+        """
+        # Disable tenacity's backoff so test doesn't wait between retries.
+        mocker.patch.object(
+            charm.LustreCharm._get_storage_devices.retry, "wait", tenacity.wait_none()
+        )
+
+        class _FlakyStorage:
+            """Storage whose .location raises `ModelError` on the first accesses."""
+
+            def __init__(self, path: str, failures: int) -> None:
+                self._path = path
+                self._failures = failures
+
+            @property
+            def location(self) -> str:
+                if self._failures > 0:
+                    self._failures -= 1
+                    raise ops.model.ModelError("storage not provisioned")
+                return self._path
+
+        mock_storage_devices["mgt-mdt"].append(_FlakyStorage("/dev/sda", failures=2))
+        mock_storage_devices["mgt-mdt"].append(_FlakyStorage("/dev/sdb", failures=0))
+        mock_peer_observer.return_value.get_app_data.return_value = LustrePeerAppData()
+
+        ctx.run(ctx.on.start(), testing.State(leader=True))
+
+        mock_mgs_mds_setup.assert_called_once_with(LUSTRE_FSNAME, MGT_MDT_DEVICES)
